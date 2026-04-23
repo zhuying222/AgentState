@@ -76,12 +76,16 @@ $script:CodexSessionRoot = Join-Path $script:CodexHome 'sessions'
 $script:CodexHistoryPath = Join-Path $script:CodexHome 'history.jsonl'
 $script:CodexLogPath = Join-Path $script:CodexHome 'log\codex-tui.log'
 $script:ClaudeHome = Join-Path $env:USERPROFILE '.claude'
+$script:ClaudeSessionRoot = Join-Path $script:ClaudeHome 'sessions'
+$script:ClaudeProjectRoot = Join-Path $script:ClaudeHome 'projects'
+$script:ClaudeTelemetryRoot = Join-Path $script:ClaudeHome 'telemetry'
 $script:ClaudeHistoryPath = Join-Path $script:ClaudeHome 'history.jsonl'
 $script:LegacyStateHome = Join-Path $env:USERPROFILE '.codex-state'
 $script:StateHome = Join-Path $env:USERPROFILE '.agent-state'
 $script:LaunchRoot = Join-Path $script:StateHome 'launches'
 $script:SettingsPath = Join-Path $script:StateHome 'config.json'
 $script:CodexLauncherPath = Join-Path $PSScriptRoot 'StartCodexTracked.bat'
+$script:ClaudeLauncherPath = Join-Path $PSScriptRoot 'StartClaudeTracked.bat'
 
 $script:ExpandedWidth = 390
 $script:ExpandedHeight = 520
@@ -107,15 +111,32 @@ $script:Settings = [ordered]@{
 $script:HistoryNames = @{}
 $script:ClaudeHistoryNames = @{}
 $script:CodexSessions = @()
+$script:ClaudeSessions = @()
+$script:ClaudeSessionByProcessId = @{}
+$script:ClaudeTelemetryFilesBySession = @{}
 $script:CodexThreadStates = @{}
 $script:CodexSessionOutcomeCache = @{}
+$script:ClaudeSessionStateCache = @{}
+$script:ClaudeTelemetryFileStateCache = @{}
 $script:CodexLogPosition = $null
 $script:InitialCodexLogReadBytes = 2097152
 $script:LastHistoryLoad = [datetime]::MinValue
 $script:LastSessionLoad = [datetime]::MinValue
+$script:LastClaudeSessionLoad = [datetime]::MinValue
+$script:LastClaudeTelemetryIndexLoad = [datetime]::MinValue
 $script:LastInstances = @()
 $script:CurrentCollapsedLength = $script:CollapsedMinLength
 $script:CurrentExpandedLength = $script:ExpandedMinLength
+$script:LaunchMatchWindowSeconds = 180
+$script:LaunchStartupGraceSeconds = 45
+$script:LaunchProcessFutureSkewSeconds = 12
+$script:LaunchIdentitySlackSeconds = 15
+$script:SessionStartMatchSeconds = 180
+$script:SessionActivityLeadSeconds = 15
+$script:SessionFutureStartGraceSeconds = 90
+$script:SessionStartPenaltySeconds = 600
+$script:ClaudeSessionLoadIntervalSeconds = 4
+$script:ClaudeTelemetryLoadIntervalSeconds = 2
 
 function Initialize-StateHome {
     if (-not (Test-Path $script:StateHome)) {
@@ -215,6 +236,12 @@ function Convert-SerializedDateTime {
     try { return ([datetimeoffset]::Parse($text)).LocalDateTime } catch { }
     try { return [datetime]$text } catch { }
     return $null
+}
+
+function Convert-UnixMillisecondsToDateTime {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    try { return [datetimeoffset]::FromUnixTimeMilliseconds([int64]$Value).LocalDateTime } catch { return $null }
 }
 
 function Clamp-Double {
@@ -538,6 +565,364 @@ function Load-HistoryNames {
     $script:ClaudeHistoryNames = $claudeNames
 }
 
+function Get-ClaudeMessageBlocks {
+    param($Message)
+    if ($null -eq $Message) { return @() }
+    if ($Message.content -is [System.Collections.IEnumerable] -and -not ($Message.content -is [string])) {
+        return @($Message.content)
+    }
+    if ($null -ne $Message.content) {
+        return @($Message.content)
+    }
+    return @()
+}
+
+function Load-ClaudeSessions {
+    if ((Get-Date) -lt $script:LastClaudeSessionLoad.AddSeconds($script:ClaudeSessionLoadIntervalSeconds)) { return }
+    $script:LastClaudeSessionLoad = Get-Date
+
+    $script:ClaudeSessions = @()
+    $script:ClaudeSessionByProcessId = @{}
+    if (-not (Test-Path $script:ClaudeSessionRoot)) { return }
+
+    $projectFilesBySession = @{}
+    if (Test-Path $script:ClaudeProjectRoot) {
+        Get-ChildItem -Recurse -File -Path $script:ClaudeProjectRoot -Filter '*.jsonl' | ForEach-Object {
+            $sessionId = [string]$_.BaseName
+            if (-not $projectFilesBySession.ContainsKey($sessionId) -or $_.LastWriteTime -gt $projectFilesBySession[$sessionId].LastWriteTime) {
+                $projectFilesBySession[$sessionId] = $_
+            }
+        }
+    }
+
+    $items = @()
+    Get-ChildItem -File -Path $script:ClaudeSessionRoot -Filter '*.json' | ForEach-Object {
+        try {
+            $obj = Get-Content -Raw -LiteralPath $_.FullName -Encoding UTF8 | ConvertFrom-Json
+            if (-not $obj.sessionId -or -not $obj.pid) { return }
+
+            $sessionId = [string]$obj.sessionId
+            $projectFile = if ($projectFilesBySession.ContainsKey($sessionId)) { $projectFilesBySession[$sessionId] } else { $null }
+            $entry = [pscustomobject]@{
+                ProcessId = [int]$obj.pid
+                SessionId = $sessionId
+                Cwd = [string]$obj.cwd
+                StartTime = Convert-UnixMillisecondsToDateTime $obj.startedAt
+                Path = if ($projectFile) { $projectFile.FullName } else { '' }
+                LastWriteTime = if ($projectFile) { $projectFile.LastWriteTime } else { $_.LastWriteTime }
+                StateFilePath = $_.FullName
+            }
+            $items += $entry
+            $script:ClaudeSessionByProcessId[[int]$obj.pid] = $entry
+        } catch { }
+    }
+
+    $script:ClaudeSessions = @($items | Sort-Object StartTime -Descending)
+}
+
+function Find-ClaudeSession {
+    param($Process)
+    if (-not $Process) { return $null }
+    Load-ClaudeSessions
+    $processId = [int]$Process.ProcessId
+    if ($script:ClaudeSessionByProcessId.ContainsKey($processId)) {
+        return $script:ClaudeSessionByProcessId[$processId]
+    }
+    return $null
+}
+
+function Load-ClaudeTelemetryIndex {
+    if ((Get-Date) -lt $script:LastClaudeTelemetryIndexLoad.AddSeconds($script:ClaudeTelemetryLoadIntervalSeconds)) { return }
+    $script:LastClaudeTelemetryIndexLoad = Get-Date
+    $script:ClaudeTelemetryFilesBySession = @{}
+    if (-not (Test-Path $script:ClaudeTelemetryRoot)) { return }
+
+    Get-ChildItem -File -Path $script:ClaudeTelemetryRoot -Filter '*.json' | ForEach-Object {
+        if ($_.Name -notmatch '^[^.]+\.([0-9a-fA-F-]{36})\.') { return }
+        $sessionId = ([string]$Matches[1]).ToLowerInvariant()
+        if (-not $script:ClaudeTelemetryFilesBySession.ContainsKey($sessionId)) {
+            $script:ClaudeTelemetryFilesBySession[$sessionId] = New-Object System.Collections.Generic.List[object]
+        }
+        [void]$script:ClaudeTelemetryFilesBySession[$sessionId].Add($_)
+    }
+
+    foreach ($sessionId in @($script:ClaudeTelemetryFilesBySession.Keys)) {
+        $script:ClaudeTelemetryFilesBySession[$sessionId] = @(
+            $script:ClaudeTelemetryFilesBySession[$sessionId] |
+                Sort-Object LastWriteTime -Descending
+        )
+    }
+}
+
+function Get-ClaudeTelemetryFileState {
+    param(
+        [System.IO.FileInfo]$File,
+        [string]$SessionId
+    )
+    if ($null -eq $File -or [string]::IsNullOrWhiteSpace($SessionId)) { return $null }
+
+    $cacheKey = [string]$File.FullName
+    $fileInfo = $null
+    try { $fileInfo = Get-Item -LiteralPath $File.FullName } catch { return $null }
+
+    if ($script:ClaudeTelemetryFileStateCache.ContainsKey($cacheKey)) {
+        $cached = $script:ClaudeTelemetryFileStateCache[$cacheKey]
+        if (
+            $cached -and
+            $cached.LastWriteTime -eq $fileInfo.LastWriteTime -and
+            $cached.Length -eq $fileInfo.Length -and
+            $cached.SessionId -eq $SessionId
+        ) {
+            return $cached.State
+        }
+    }
+
+    $state = $null
+    $lines = @(Read-FileTailLines -Path $fileInfo.FullName -MaxBytes 1572864 -MaxLines 1200)
+    [array]::Reverse($lines)
+
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $entry = $null
+        try { $entry = $line | ConvertFrom-Json } catch { continue }
+        if (-not $entry -or -not $entry.event_data) { continue }
+
+        $eventData = $entry.event_data
+        $eventSessionId = [string]$eventData.session_id
+        if ([string]::IsNullOrWhiteSpace($eventSessionId)) { continue }
+        if ($eventSessionId.ToLowerInvariant() -ne $SessionId) { continue }
+
+        $timestamp = Convert-SerializedDateTime $eventData.client_timestamp
+        if ($null -eq $timestamp) { continue }
+
+        $eventName = [string]$eventData.event_name
+        switch ($eventName) {
+            'tengu_api_query' {
+                $state = [pscustomobject]@{
+                    SessionId = $SessionId
+                    Source = 'Telemetry'
+                    LastKind = 'api_query'
+                    LastTimestamp = $timestamp
+                    LastAssistantText = ''
+                    LastErrorText = ''
+                    LastErrorTime = $null
+                }
+            }
+            'tengu_api_success' {
+                $state = [pscustomobject]@{
+                    SessionId = $SessionId
+                    Source = 'Telemetry'
+                    LastKind = 'api_success'
+                    LastTimestamp = $timestamp
+                    LastAssistantText = ''
+                    LastErrorText = ''
+                    LastErrorTime = $null
+                }
+            }
+            'tengu_api_error' {
+                $state = [pscustomobject]@{
+                    SessionId = $SessionId
+                    Source = 'Telemetry'
+                    LastKind = 'api_error'
+                    LastTimestamp = $timestamp
+                    LastAssistantText = ''
+                    LastErrorText = 'Claude request failed'
+                    LastErrorTime = $timestamp
+                }
+            }
+        }
+
+        if ($state) { break }
+    }
+
+    $script:ClaudeTelemetryFileStateCache[$cacheKey] = [pscustomobject]@{
+        SessionId = $SessionId
+        LastWriteTime = $fileInfo.LastWriteTime
+        Length = $fileInfo.Length
+        State = $state
+    }
+
+    return $state
+}
+
+function Get-ClaudeTelemetryState {
+    param($Session)
+    if ($null -eq $Session -or [string]::IsNullOrWhiteSpace([string]$Session.SessionId)) { return $null }
+
+    Load-ClaudeTelemetryIndex
+    $sessionId = ([string]$Session.SessionId).ToLowerInvariant()
+    if (-not $script:ClaudeTelemetryFilesBySession.ContainsKey($sessionId)) { return $null }
+
+    foreach ($file in @($script:ClaudeTelemetryFilesBySession[$sessionId])) {
+        $state = Get-ClaudeTelemetryFileState -File $file -SessionId $sessionId
+        if ($state) { return $state }
+    }
+
+    return $null
+}
+
+function Get-ClaudeSessionState {
+    param($Session)
+    if ($null -eq $Session -or [string]::IsNullOrWhiteSpace([string]$Session.Path) -or -not (Test-Path $Session.Path)) {
+        return $null
+    }
+
+    $cacheKey = [string]$Session.SessionId
+    $file = $null
+    try { $file = Get-Item -LiteralPath $Session.Path } catch { return $null }
+
+    if ($script:ClaudeSessionStateCache.ContainsKey($cacheKey)) {
+        $cached = $script:ClaudeSessionStateCache[$cacheKey]
+        if (
+            $cached -and
+            $cached.LastWriteTime -eq $file.LastWriteTime -and
+            $cached.Length -eq $file.Length
+        ) {
+            return $cached.State
+        }
+    }
+
+    $state = [pscustomobject]@{
+        SessionId = [string]$Session.SessionId
+        Source = 'Transcript'
+        LastKind = ''
+        LastTimestamp = $null
+        LastAssistantText = ''
+        LastErrorText = ''
+        LastErrorTime = $null
+        LastUserPromptTime = $null
+        LastAssistantTextTime = $null
+        LastWorkingTime = $null
+        LastTurnCompleteTime = $null
+    }
+
+    foreach ($line in (Read-FileTailLines -Path $Session.Path -MaxBytes 1572864 -MaxLines 260)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $entry = $null
+        try { $entry = $line | ConvertFrom-Json } catch { continue }
+        if (-not $entry) { continue }
+
+        $timestamp = Convert-SerializedDateTime $entry.timestamp
+        if ($null -eq $timestamp -and $entry.snapshot -and $entry.snapshot.timestamp) {
+            $timestamp = Convert-SerializedDateTime $entry.snapshot.timestamp
+        }
+        if ($null -eq $timestamp) { continue }
+
+        switch ([string]$entry.type) {
+            'user' {
+                $isToolResult = $false
+                $isToolError = $false
+                $isInterrupted = $false
+                $userText = Shorten-Text (Convert-StructuredText $entry.message.content) 120
+                if ($userText -eq '[Request interrupted by user]') {
+                    $isInterrupted = $true
+                }
+                if ($entry.toolUseResult) {
+                    $isToolResult = $true
+                    if ($entry.toolUseResult.interrupted) {
+                        $isInterrupted = $true
+                    }
+                    if ([string]$entry.toolUseResult -match '^(Error:|.*\bis_error\b.*)$') {
+                        $isToolError = $true
+                    }
+                }
+
+                $blocks = @(Get-ClaudeMessageBlocks $entry.message)
+                foreach ($block in $blocks) {
+                    if ($block.type -eq 'tool_result') {
+                        $isToolResult = $true
+                        if ($block.is_error -or ([string]$block.content -match '^(Error:|.*exceeds maximum allowed tokens.*)$')) {
+                            $isToolError = $true
+                        }
+                    }
+                }
+
+                if ($isToolResult) {
+                    $state.LastTimestamp = $timestamp
+                    if ($isInterrupted) {
+                        $state.LastKind = 'interrupted'
+                    } elseif ($isToolError) {
+                        $state.LastWorkingTime = $timestamp
+                        $state.LastKind = 'tool_error'
+                        $state.LastErrorTime = $timestamp
+                        $state.LastErrorText = Shorten-Text (Convert-StructuredText $entry.message.content) 120
+                    } else {
+                        $state.LastWorkingTime = $timestamp
+                        $state.LastKind = 'tool_result'
+                    }
+                } else {
+                    $state.LastTimestamp = $timestamp
+                    if ($isInterrupted) {
+                        $state.LastKind = 'interrupted'
+                    } else {
+                        $state.LastUserPromptTime = $timestamp
+                        $state.LastWorkingTime = $timestamp
+                        $state.LastKind = 'user_prompt'
+                    }
+                }
+            }
+            'assistant' {
+                $blocks = @(Get-ClaudeMessageBlocks $entry.message)
+                $hasToolUse = $false
+                $hasThinking = $false
+                $assistantText = ''
+                $stopReason = ''
+                if ($entry.message -and $entry.message.stop_reason) {
+                    $stopReason = [string]$entry.message.stop_reason
+                }
+
+                foreach ($block in $blocks) {
+                    if ($block.type -eq 'tool_use') {
+                        $hasToolUse = $true
+                    } elseif ($block.type -like '*thinking*') {
+                        $hasThinking = $true
+                    } elseif ($block.type -eq 'text' -and -not [string]::IsNullOrWhiteSpace([string]$block.text)) {
+                        $assistantText = [string]$block.text
+                    }
+                }
+
+                $state.LastTimestamp = $timestamp
+                if ($hasToolUse) {
+                    $state.LastKind = 'assistant_tool'
+                    $state.LastWorkingTime = $timestamp
+                } elseif ($hasThinking) {
+                    $state.LastKind = 'assistant_thinking'
+                    $state.LastWorkingTime = $timestamp
+                } elseif (-not [string]::IsNullOrWhiteSpace($assistantText)) {
+                    $state.LastAssistantText = Shorten-Text $assistantText 120
+                    if ([string]::IsNullOrWhiteSpace($stopReason) -or $stopReason -eq 'tool_use') {
+                        $state.LastKind = 'assistant_text_pending'
+                        $state.LastWorkingTime = $timestamp
+                    } else {
+                        $state.LastKind = 'assistant_text'
+                        $state.LastAssistantTextTime = $timestamp
+                    }
+                }
+            }
+            'progress' {
+                $state.LastTimestamp = $timestamp
+                $state.LastWorkingTime = $timestamp
+                $state.LastKind = 'progress'
+            }
+            'system' {
+                if ($entry.subtype -eq 'turn_duration') {
+                    $state.LastTimestamp = $timestamp
+                    $state.LastTurnCompleteTime = $timestamp
+                    $state.LastKind = 'turn_complete'
+                }
+            }
+        }
+    }
+
+    $script:ClaudeSessionStateCache[$cacheKey] = [pscustomobject]@{
+        LastWriteTime = $file.LastWriteTime
+        Length = $file.Length
+        State = $state
+    }
+
+    return $state
+}
+
 function Ensure-CodexThreadState {
     param([string]$SessionId)
     if (-not $script:CodexThreadStates.ContainsKey($SessionId)) {
@@ -686,6 +1071,12 @@ function Load-LaunchRecords {
                     LauncherProcessId = if ($obj.LauncherProcessId) { [int]$obj.LauncherProcessId } else { 0 }
                     ParentProcessId = if ($obj.ParentProcessId) { [int]$obj.ParentProcessId } else { 0 }
                     RootShellProcessId = if ($obj.RootShellProcessId) { [int]$obj.RootShellProcessId } else { 0 }
+                    LauncherProcessName = if ($obj.LauncherProcessName) { [string]$obj.LauncherProcessName } else { '' }
+                    ParentProcessName = if ($obj.ParentProcessName) { [string]$obj.ParentProcessName } else { '' }
+                    RootShellProcessName = if ($obj.RootShellProcessName) { [string]$obj.RootShellProcessName } else { '' }
+                    LauncherProcessStartedAt = Convert-SerializedDateTime $obj.LauncherProcessStartedAt
+                    ParentProcessStartedAt = Convert-SerializedDateTime $obj.ParentProcessStartedAt
+                    RootShellProcessStartedAt = Convert-SerializedDateTime $obj.RootShellProcessStartedAt
                     FilePath = $_.FullName
                 }
             }
@@ -698,6 +1089,8 @@ function Load-LaunchRecords {
 function Get-AgentProcesses {
     $items = @()
     $all = Get-ProcessSnapshot
+    $shellNames = @('cmd.exe', 'powershell.exe', 'pwsh.exe', 'bash.exe', 'wsl.exe')
+    Load-ClaudeSessions
 
     foreach ($proc in $all.Values) {
         $commandLine = [string]$proc.CommandLine
@@ -712,6 +1105,14 @@ function Get-AgentProcesses {
 
         $parent = $null
         if ($all.ContainsKey([int]$proc.ParentProcessId)) { $parent = $all[[int]$proc.ParentProcessId] }
+        $lineage = Get-AgentProcessLineageInfo -Process $proc -ProcessMap $all -AgentType $agentType
+        $groupKey = if ($lineage.RootShellProcessId -gt 0) {
+            '{0}:shell:{1}' -f $agentType, $lineage.RootShellProcessId
+        } elseif ([int]$proc.ParentProcessId -gt 0) {
+            '{0}:parent:{1}' -f $agentType, ([int]$proc.ParentProcessId)
+        } else {
+            '{0}:pid:{1}' -f $agentType, ([int]$proc.ProcessId)
+        }
         $items += [pscustomobject]@{
             AgentType = $agentType
             ProcessId = [int]$proc.ProcessId
@@ -720,10 +1121,40 @@ function Get-AgentProcesses {
             ParentStartTime = if ($parent) { Convert-WmiTime $parent.CreationDate } else { Convert-WmiTime $proc.CreationDate }
             CommandLine = $commandLine
             ParentCommandLine = if ($parent) { [string]$parent.CommandLine } else { '' }
+            ParentName = if ($parent) { [string]$parent.Name } else { '' }
+            RootShellProcessId = [int]$lineage.RootShellProcessId
+            GroupKey = $groupKey
+            HasSameAgentAncestor = [bool]$lineage.HasSameAgentAncestor
+            DepthToShell = [int]$lineage.DepthToShell
+            IsDirectShellChild = [bool]$lineage.IsDirectShellChild
+            HasLiveClaudeSession = if ($agentType -eq 'Claude') { $script:ClaudeSessionByProcessId.ContainsKey([int]$proc.ProcessId) } else { $false }
         }
     }
 
-    return @($items | Sort-Object AgentType, StartTime)
+    $result = @()
+    $result += @($items | Where-Object { $_.AgentType -ne 'Claude' })
+
+    $claudeCandidates = @(
+        $items |
+        Where-Object { $_.AgentType -eq 'Claude' -and -not $_.HasSameAgentAncestor }
+    )
+
+    foreach ($group in ($claudeCandidates | Group-Object GroupKey)) {
+        $selected = $group.Group |
+            Sort-Object `
+                @{ Expression = { if ($_.HasLiveClaudeSession) { 0 } else { 1 } } }, `
+                @{ Expression = { if ($_.IsDirectShellChild) { 0 } else { 1 } } }, `
+                @{ Expression = { $_.DepthToShell } }, `
+                @{ Expression = { if ($shellNames -contains $_.ParentName) { 0 } else { 1 } } }, `
+                StartTime, `
+                ProcessId |
+            Select-Object -First 1
+        if ($selected) {
+            $result += $selected
+        }
+    }
+
+    return @($result | Sort-Object AgentType, StartTime, ProcessId)
 }
 
 function Get-ProcessSnapshot {
@@ -756,6 +1187,56 @@ function Get-ProcessAncestors {
         $currentId = [int]$proc.ParentProcessId
     }
     return @($items)
+}
+
+function Get-AgentProcessLineageInfo {
+    param(
+        $Process,
+        [hashtable]$ProcessMap,
+        [string]$AgentType
+    )
+
+    $shellNames = @('cmd.exe', 'powershell.exe', 'pwsh.exe', 'bash.exe', 'wsl.exe')
+    $stopNames = @('explorer.exe', 'Code.exe', 'devenv.exe')
+    $rootShellPid = 0
+    $depthToShell = 999
+    $hasSameAgentAncestor = $false
+    $isDirectShellChild = $false
+    $depth = 0
+
+    foreach ($ancestor in (Get-ProcessAncestors -ProcessId ([int]$Process.ProcessId) -ProcessMap $ProcessMap)) {
+        if ($depth -gt 0 -and $stopNames -contains $ancestor.Name) { break }
+
+        if ($depth -gt 0) {
+            if ($AgentType -eq 'Claude' -and $ancestor.Name -eq 'claude.exe') {
+                $hasSameAgentAncestor = $true
+            }
+            if (
+                $AgentType -eq 'Codex' -and
+                $ancestor.Name -eq 'node.exe' -and
+                [string]$ancestor.CommandLine -match '@openai[\\/]+codex[\\/]+bin[\\/]+codex\.js'
+            ) {
+                $hasSameAgentAncestor = $true
+            }
+        }
+
+        if ($shellNames -contains $ancestor.Name) {
+            $rootShellPid = [int]$ancestor.ProcessId
+            if ($depthToShell -eq 999) {
+                $depthToShell = $depth
+                $isDirectShellChild = $depth -eq 1
+            }
+        }
+
+        $depth += 1
+    }
+
+    return [pscustomobject]@{
+        RootShellProcessId = $rootShellPid
+        DepthToShell = $depthToShell
+        HasSameAgentAncestor = $hasSameAgentAncestor
+        IsDirectShellChild = $isDirectShellChild
+    }
 }
 
 function Get-DescendantProcessIds {
@@ -867,33 +1348,67 @@ function Find-BestCodexSession {
 
     $bestSession = $null
     $bestScore = [double]::MaxValue
+    $anchorTimes = @($ReferenceTime, $AlternateTime | Where-Object { $_ -ne [datetime]::MinValue })
+    $now = Get-Date
     foreach ($candidate in $script:CodexSessions) {
         if ($AssignedSessions -and $AssignedSessions.ContainsKey($candidate.SessionId)) { continue }
 
-        $score = [double]::MaxValue
-        $candidateTimes = @($candidate.StartTime)
-        if ($candidate.LastWriteTime) {
-            $candidateTimes += [datetime]$candidate.LastWriteTime
-        }
+        $threadState = $null
         if ($script:CodexThreadStates.ContainsKey($candidate.SessionId)) {
             $threadState = $script:CodexThreadStates[$candidate.SessionId]
+        }
+
+        $hasStrongSignal = $false
+        $startsTooLate = $true
+        $bestStartDelta = [double]::MaxValue
+        $latestActivityTime = $null
+
+        if ($candidate.LastWriteTime) {
+            $latestActivityTime = [datetime]$candidate.LastWriteTime
+        }
+
+        if ($threadState) {
             foreach ($activityTime in @($threadState.LastStartTime, $threadState.LastActivityTime, $threadState.LastCloseTime, $threadState.LastFatalTime)) {
-                if ($activityTime) {
-                    $candidateTimes += [datetime]$activityTime
+                if ($activityTime -and ($null -eq $latestActivityTime -or $activityTime -gt $latestActivityTime)) {
+                    $latestActivityTime = [datetime]$activityTime
                 }
             }
         }
 
-        foreach ($candidateTime in $candidateTimes) {
-            if ($ReferenceTime -ne [datetime]::MinValue) {
-                $score = [Math]::Min($score, [Math]::Abs(($candidateTime - $ReferenceTime).TotalSeconds))
+        foreach ($anchorTime in $anchorTimes) {
+            if ($candidate.StartTime -le $anchorTime.AddSeconds($script:SessionFutureStartGraceSeconds)) {
+                $startsTooLate = $false
             }
-            if ($AlternateTime -ne [datetime]::MinValue) {
-                $score = [Math]::Min($score, [Math]::Abs(($candidateTime - $AlternateTime).TotalSeconds))
+
+            $startDelta = [Math]::Abs(($candidate.StartTime - $anchorTime).TotalSeconds)
+            if ($startDelta -lt $bestStartDelta) {
+                $bestStartDelta = $startDelta
+            }
+
+            if ($startDelta -le $script:SessionStartMatchSeconds) {
+                $hasStrongSignal = $true
+            }
+
+            if ($latestActivityTime -and $latestActivityTime -ge $anchorTime.AddSeconds(-$script:SessionActivityLeadSeconds)) {
+                $hasStrongSignal = $true
             }
         }
 
-        if ($score -lt $bestScore -and $score -lt 900) {
+        if ($startsTooLate) { continue }
+        if (-not $hasStrongSignal) { continue }
+
+        $recencyPenalty = 86400.0
+        if ($latestActivityTime) {
+            $recencyPenalty = [Math]::Max(0, ($now - $latestActivityTime).TotalSeconds)
+        }
+        $startPenalty = if ($bestStartDelta -le $script:SessionStartMatchSeconds) {
+            $bestStartDelta / 1000.0
+        } else {
+            $script:SessionStartPenaltySeconds + ($bestStartDelta / 1000.0)
+        }
+        $score = $recencyPenalty + $startPenalty
+
+        if ($score -lt $bestScore) {
             $bestSession = $candidate
             $bestScore = $score
         }
@@ -914,11 +1429,15 @@ function Find-BestLaunchRecord {
     if ($ReferenceTime -eq [datetime]::MinValue -and -not $Process) { return $null }
 
     $lineageIds = $null
+    $lineageMap = $null
     if ($Process -and $ProcessMap) {
         $lineageIds = New-Object System.Collections.Generic.HashSet[int]
+        $lineageMap = @{}
         [void]$lineageIds.Add([int]$Process.ProcessId)
+        $lineageMap[[int]$Process.ProcessId] = $ProcessMap[[int]$Process.ProcessId]
         foreach ($ancestorProc in (Get-ProcessAncestors -ProcessId ([int]$Process.ProcessId) -ProcessMap $ProcessMap)) {
             [void]$lineageIds.Add([int]$ancestorProc.ProcessId)
+            $lineageMap[[int]$ancestorProc.ProcessId] = $ancestorProc
         }
     }
 
@@ -931,9 +1450,24 @@ function Find-BestLaunchRecord {
         $score = [double]::MaxValue
         if ($lineageIds) {
             $pidScore = 1000
-            if ($record.LauncherProcessId -gt 0 -and $lineageIds.Contains([int]$record.LauncherProcessId)) { $pidScore = [Math]::Min($pidScore, 0) }
-            if ($record.ParentProcessId -gt 0 -and $lineageIds.Contains([int]$record.ParentProcessId)) { $pidScore = [Math]::Min($pidScore, 1) }
-            if ($record.RootShellProcessId -gt 0 -and $lineageIds.Contains([int]$record.RootShellProcessId)) { $pidScore = [Math]::Min($pidScore, 2) }
+            if ($record.LauncherProcessId -gt 0 -and $lineageIds.Contains([int]$record.LauncherProcessId)) {
+                $candidate = $lineageMap[[int]$record.LauncherProcessId]
+                if (Test-LaunchProcessIdentity -Launch $record -Process $candidate -Role 'Launcher') {
+                    $pidScore = [Math]::Min($pidScore, 0)
+                }
+            }
+            if ($record.ParentProcessId -gt 0 -and $lineageIds.Contains([int]$record.ParentProcessId)) {
+                $candidate = $lineageMap[[int]$record.ParentProcessId]
+                if (Test-LaunchProcessIdentity -Launch $record -Process $candidate -Role 'Parent') {
+                    $pidScore = [Math]::Min($pidScore, 1)
+                }
+            }
+            if ($record.RootShellProcessId -gt 0 -and $lineageIds.Contains([int]$record.RootShellProcessId)) {
+                $candidate = $lineageMap[[int]$record.RootShellProcessId]
+                if (Test-LaunchProcessIdentity -Launch $record -Process $candidate -Role 'RootShell') {
+                    $pidScore = [Math]::Min($pidScore, 2)
+                }
+            }
             if ($pidScore -lt 1000) {
                 $score = $pidScore
             }
@@ -942,13 +1476,83 @@ function Find-BestLaunchRecord {
         if ($ReferenceTime -ne [datetime]::MinValue) {
             $score = [Math]::Min($score, [Math]::Abs(($record.StartedAt - $ReferenceTime).TotalSeconds))
         }
-        if ($score -lt $bestScore -and $score -lt 180) {
+        if ($score -lt $bestScore -and $score -lt $script:LaunchMatchWindowSeconds) {
             $bestLaunch = $record
             $bestScore = $score
         }
     }
 
     return $bestLaunch
+}
+
+function Get-LaunchExpectedProcessNames {
+    param([string]$Role)
+    switch ($Role) {
+        'Launcher' { return @('powershell.exe', 'pwsh.exe') }
+        default { return @('cmd.exe', 'powershell.exe', 'pwsh.exe', 'bash.exe', 'wsl.exe', 'conhost.exe', 'openconsole.exe', 'WindowsTerminal.exe', 'windowsterminal.exe') }
+    }
+}
+
+function Get-LaunchRecordedProcessName {
+    param(
+        $Launch,
+        [string]$Role
+    )
+    switch ($Role) {
+        'Launcher' { return [string]$Launch.LauncherProcessName }
+        'Parent' { return [string]$Launch.ParentProcessName }
+        'RootShell' { return [string]$Launch.RootShellProcessName }
+    }
+    return ''
+}
+
+function Get-LaunchRecordedProcessStartTime {
+    param(
+        $Launch,
+        [string]$Role
+    )
+    switch ($Role) {
+        'Launcher' { return $Launch.LauncherProcessStartedAt }
+        'Parent' { return $Launch.ParentProcessStartedAt }
+        'RootShell' { return $Launch.RootShellProcessStartedAt }
+    }
+    return $null
+}
+
+function Test-LaunchProcessIdentity {
+    param(
+        $Launch,
+        $Process,
+        [string]$Role
+    )
+    if (-not $Launch -or -not $Process) { return $false }
+
+    $processName = [string]$Process.Name
+    if ([string]::IsNullOrWhiteSpace($processName)) { return $false }
+
+    $expectedNames = @(Get-LaunchExpectedProcessNames -Role $Role)
+    if ($expectedNames.Count -gt 0 -and -not ($expectedNames -contains $processName)) {
+        return $false
+    }
+
+    $recordedName = Get-LaunchRecordedProcessName -Launch $Launch -Role $Role
+    if (-not [string]::IsNullOrWhiteSpace($recordedName) -and $recordedName -ne $processName) {
+        return $false
+    }
+
+    $processStart = Convert-WmiTime $Process.CreationDate
+    if ($processStart -gt $Launch.StartedAt.AddSeconds($script:LaunchProcessFutureSkewSeconds)) {
+        return $false
+    }
+
+    $recordedStart = Get-LaunchRecordedProcessStartTime -Launch $Launch -Role $Role
+    if ($recordedStart) {
+        if ([Math]::Abs(($processStart - $recordedStart).TotalSeconds) -gt $script:LaunchIdentitySlackSeconds) {
+            return $false
+        }
+    }
+
+    return $true
 }
 
 function Get-LiveLaunchProcess {
@@ -958,19 +1562,17 @@ function Get-LiveLaunchProcess {
     )
     if (-not $Launch -or -not $ProcessMap) { return $null }
 
-    $candidatePids = New-Object 'System.Collections.Generic.List[int]'
-    foreach ($candidatePidValue in @(
-        [int]$Launch.RootShellProcessId,
-        [int]$Launch.ParentProcessId,
-        [int]$Launch.LauncherProcessId
-    )) {
-        Add-UniqueProcessId -List $candidatePids -ProcessId $candidatePidValue
-    }
+    $candidates = @(
+        [pscustomobject]@{ ProcessId = [int]$Launch.LauncherProcessId; Role = 'Launcher' },
+        [pscustomobject]@{ ProcessId = [int]$Launch.ParentProcessId; Role = 'Parent' },
+        [pscustomobject]@{ ProcessId = [int]$Launch.RootShellProcessId; Role = 'RootShell' }
+    )
 
-    foreach ($candidatePid in $candidatePids) {
-        if (-not $ProcessMap.ContainsKey($candidatePid)) { continue }
+    foreach ($candidate in $candidates) {
+        if ($candidate.ProcessId -le 0 -or -not $ProcessMap.ContainsKey($candidate.ProcessId)) { continue }
 
-        $proc = $ProcessMap[$candidatePid]
+        $proc = $ProcessMap[$candidate.ProcessId]
+        if (-not (Test-LaunchProcessIdentity -Launch $Launch -Process $proc -Role $candidate.Role)) { continue }
         $parent = $null
         if ($proc.ParentProcessId -gt 0 -and $ProcessMap.ContainsKey([int]$proc.ParentProcessId)) {
             $parent = $ProcessMap[[int]$proc.ParentProcessId]
@@ -995,6 +1597,7 @@ function Get-LiveLaunchProcess {
 function Match-Instances {
     param([object[]]$Processes)
     Load-CodexSessions
+    Load-ClaudeSessions
     $launches = Load-LaunchRecords
     $processMap = Get-ProcessSnapshot
     $assignedSessions = @{}
@@ -1002,10 +1605,11 @@ function Match-Instances {
     $matched = @()
 
     foreach ($proc in $Processes) {
-        $session = if ($proc.AgentType -eq 'Codex') {
-            Find-BestCodexSession -ReferenceTime $proc.StartTime -AlternateTime $proc.ParentStartTime -AssignedSessions $assignedSessions
-        } else {
-            $null
+        $session = $null
+        if ($proc.AgentType -eq 'Codex') {
+            $session = Find-BestCodexSession -ReferenceTime $proc.StartTime -AlternateTime $proc.ParentStartTime -AssignedSessions $assignedSessions
+        } elseif ($proc.AgentType -eq 'Claude') {
+            $session = Find-ClaudeSession -Process $proc
         }
 
         $launch = Find-BestLaunchRecord -AgentType $proc.AgentType -ReferenceTime $proc.StartTime -Launches $launches -AssignedLaunches $assignedLaunches -Process $proc -ProcessMap $processMap
@@ -1023,28 +1627,57 @@ function Match-Instances {
 
     foreach ($launch in ($launches | Sort-Object StartedAt -Descending)) {
         if ($assignedLaunches.ContainsKey($launch.InstanceId)) { continue }
+        if ((Get-Date) -gt $launch.StartedAt.AddSeconds($script:LaunchStartupGraceSeconds)) { continue }
 
         $liveProcess = Get-LiveLaunchProcess -Launch $launch -ProcessMap $processMap
         if (-not $liveProcess) { continue }
-
-        $session = if ($launch.AgentType -eq 'Codex') {
-            Find-BestCodexSession -ReferenceTime $launch.StartedAt -AssignedSessions $assignedSessions
-        } else {
-            $null
-        }
-
-        if ($session) { $assignedSessions[$session.SessionId] = $true }
         $assignedLaunches[$launch.InstanceId] = $true
         $matched += [pscustomobject]@{
             AgentType = $launch.AgentType
             Process = $liveProcess
-            Session = $session
+            Session = $null
             Launch = $launch
             LaunchOnly = $true
         }
     }
 
     return $matched
+}
+
+function Get-ClaudeStatusDetail {
+    param($State)
+    if (-not $State) { return 'Claude session mapped; waiting for activity' }
+    switch ([string]$State.LastKind) {
+        'api_query' { return 'Claude is thinking' }
+        'api_success' { return 'Claude is ready' }
+        'api_error' {
+            if (-not [string]::IsNullOrWhiteSpace($State.LastErrorText)) { return $State.LastErrorText }
+            return 'Claude request failed'
+        }
+        'interrupted' { return 'Claude request interrupted' }
+        'user_prompt' { return 'waiting for Claude response' }
+        'assistant_thinking' { return 'Claude is thinking' }
+        'assistant_tool' { return 'Claude is using tools' }
+        'assistant_text_pending' {
+            if (-not [string]::IsNullOrWhiteSpace($State.LastAssistantText)) { return $State.LastAssistantText }
+            return 'Claude is responding'
+        }
+        'tool_result' { return 'Claude is processing tool output' }
+        'progress' { return 'Claude is running a task' }
+        'tool_error' {
+            if (-not [string]::IsNullOrWhiteSpace($State.LastErrorText)) { return $State.LastErrorText }
+            return 'Claude tool error'
+        }
+        'assistant_text' {
+            if (-not [string]::IsNullOrWhiteSpace($State.LastAssistantText)) { return $State.LastAssistantText }
+            return 'Claude replied'
+        }
+        'turn_complete' {
+            if (-not [string]::IsNullOrWhiteSpace($State.LastAssistantText)) { return $State.LastAssistantText }
+            return 'Claude is ready'
+        }
+    }
+    return 'Claude session active'
 }
 
 function Get-DisplayName {
@@ -1060,6 +1693,12 @@ function Get-DisplayName {
     }
 
     if ($Instance.AgentType -eq 'Claude') {
+        if ($Instance.Session -and $script:ClaudeHistoryNames.ContainsKey($Instance.Session.SessionId)) {
+            return $script:ClaudeHistoryNames[$Instance.Session.SessionId]
+        }
+        if ($Instance.Session -and $Instance.Session.Cwd) {
+            return "Claude - $(Split-Path -Leaf $Instance.Session.Cwd)"
+        }
         if ($Instance.Launch -and $Instance.Launch.WorkingDirectory) {
             return "Claude - $(Split-Path -Leaf $Instance.Launch.WorkingDirectory)"
         }
@@ -1072,11 +1711,68 @@ function Get-DisplayName {
 function Get-InstanceStatus {
     param($Instance)
     if ($Instance.AgentType -eq 'Claude') {
+        if ($null -eq $Instance.Session) {
+            if ($Instance.LaunchOnly -and $Instance.Launch) {
+                return [pscustomobject]@{
+                    Code = 'Starting'
+                    Label = 'starting'
+                    Brush = '#58a6ff'
+                    Detail = 'terminal launched; waiting for Claude session'
+                }
+            }
+            return [pscustomobject]@{
+                Code = 'Ready'
+                Label = 'active'
+                Brush = '#35d07f'
+                Detail = 'Claude process detected; session not mapped yet'
+            }
+        }
+
+        $telemetryState = Get-ClaudeTelemetryState $Instance.Session
+        $transcriptState = Get-ClaudeSessionState $Instance.Session
+        $state = $null
+        if ($telemetryState -and $transcriptState) {
+            if ($telemetryState.LastTimestamp -and $transcriptState.LastTimestamp) {
+                if ($telemetryState.LastTimestamp -ge $transcriptState.LastTimestamp) {
+                    $state = $telemetryState
+                } else {
+                    $state = $transcriptState
+                }
+            } elseif ($telemetryState.LastTimestamp) {
+                $state = $telemetryState
+            } else {
+                $state = $transcriptState
+            }
+        } elseif ($telemetryState) {
+            $state = $telemetryState
+        } else {
+            $state = $transcriptState
+        }
+
+        if ($state) {
+            $detail = Get-ClaudeStatusDetail $state
+            switch ([string]$state.LastKind) {
+                'api_query' { return [pscustomobject]@{ Code = 'Working'; Label = 'working'; Brush = '#ffc247'; Detail = $detail } }
+                'api_success' { return [pscustomobject]@{ Code = 'Ready'; Label = 'ready'; Brush = '#35d07f'; Detail = $detail } }
+                'api_error' { return [pscustomobject]@{ Code = 'Error'; Label = 'error'; Brush = '#ff4d5e'; Detail = $detail } }
+                'interrupted' { return [pscustomobject]@{ Code = 'Ready'; Label = 'ready'; Brush = '#35d07f'; Detail = $detail } }
+                'user_prompt' { return [pscustomobject]@{ Code = 'Working'; Label = 'working'; Brush = '#ffc247'; Detail = $detail } }
+                'assistant_thinking' { return [pscustomobject]@{ Code = 'Working'; Label = 'working'; Brush = '#ffc247'; Detail = $detail } }
+                'assistant_tool' { return [pscustomobject]@{ Code = 'Working'; Label = 'working'; Brush = '#ffc247'; Detail = $detail } }
+                'assistant_text_pending' { return [pscustomobject]@{ Code = 'Working'; Label = 'working'; Brush = '#ffc247'; Detail = $detail } }
+                'tool_result' { return [pscustomobject]@{ Code = 'Working'; Label = 'working'; Brush = '#ffc247'; Detail = $detail } }
+                'progress' { return [pscustomobject]@{ Code = 'Working'; Label = 'working'; Brush = '#ffc247'; Detail = $detail } }
+                'tool_error' { return [pscustomobject]@{ Code = 'Error'; Label = 'error'; Brush = '#ff4d5e'; Detail = $detail } }
+                'assistant_text' { return [pscustomobject]@{ Code = 'Ready'; Label = 'ready'; Brush = '#35d07f'; Detail = $detail } }
+                'turn_complete' { return [pscustomobject]@{ Code = 'Ready'; Label = 'ready'; Brush = '#35d07f'; Detail = $detail } }
+            }
+        }
+
         return [pscustomobject]@{
             Code = 'Ready'
             Label = 'active'
             Brush = '#35d07f'
-            Detail = 'Claude process detected; fine-grained state unavailable'
+            Detail = 'Claude session detected; waiting for activity'
         }
     }
 
@@ -1419,6 +2115,12 @@ function Start-NewCodex {
     Start-Process -FilePath $script:CodexLauncherPath -WorkingDirectory $cwd | Out-Null
 }
 
+function Start-NewClaude {
+    if (-not (Test-Path $script:ClaudeLauncherPath)) { return }
+    $cwd = Get-DefaultStartDirectory
+    Start-Process -FilePath $script:ClaudeLauncherPath -WorkingDirectory $cwd | Out-Null
+}
+
 function New-TextBlock {
     param(
         [string]$Text,
@@ -1471,8 +2173,8 @@ Read-CodexLogUpdates
 if ($SelfTest) {
     $processes = Get-AgentProcesses
     $instances = Match-Instances $processes
-    Write-Output ("Processes: {0}" -f $processes.Count)
-    Write-Output ("Instances: {0}" -f $instances.Count)
+    Write-Output ("Processes: {0}" -f [int](@($processes).Count))
+    Write-Output ("Instances: {0}" -f [int](@($instances).Count))
     $rows = foreach ($instance in $instances) {
         $status = Get-InstanceStatus $instance
         $target = Find-AgentWindow $instance
@@ -1553,6 +2255,7 @@ $footer.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefiniti
 $footer.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = '66' }))
 $footer.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = '*' }))
 $footer.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = '42' }))
+$footer.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = '42' }))
 [System.Windows.Controls.DockPanel]::SetDock($footer, 'Bottom')
 $dock.Children.Add($footer) | Out-Null
 
@@ -1583,6 +2286,24 @@ $exitButton.Add_Click({
 [System.Windows.Controls.Grid]::SetColumn($exitButton, 1)
 $footer.Children.Add($exitButton) | Out-Null
 
+$claudePlusButton = New-Object System.Windows.Controls.Button
+$claudePlusButton.Content = '+'
+$claudePlusButton.Width = 32
+$claudePlusButton.Height = 32
+$claudePlusButton.FontSize = 20
+$claudePlusButton.FontWeight = 'Bold'
+$claudePlusButton.Background = '#f0883e'
+$claudePlusButton.Foreground = '#ffffff'
+$claudePlusButton.BorderBrush = '#ffb86b'
+$claudePlusButton.ToolTip = 'Start new Claude terminal'
+$claudePlusButton.Add_Click({
+    param($sender, $eventArgs)
+    $eventArgs.Handled = $true
+    Start-NewClaude
+})
+[System.Windows.Controls.Grid]::SetColumn($claudePlusButton, 3)
+$footer.Children.Add($claudePlusButton) | Out-Null
+
 $plusButton = New-Object System.Windows.Controls.Button
 $plusButton.Content = '+'
 $plusButton.Width = 32
@@ -1598,7 +2319,7 @@ $plusButton.Add_Click({
     $eventArgs.Handled = $true
     Start-NewCodex
 })
-[System.Windows.Controls.Grid]::SetColumn($plusButton, 3)
+[System.Windows.Controls.Grid]::SetColumn($plusButton, 4)
 $footer.Children.Add($plusButton) | Out-Null
 
 $itemsPanel = New-Object System.Windows.Controls.StackPanel

@@ -6,13 +6,31 @@ if (-not (Test-Path $launchRoot)) {
     New-Item -ItemType Directory -Path $launchRoot -Force | Out-Null
 }
 
+function Convert-WmiDateToIsoString {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) { return ([datetimeoffset]$Value).ToString('o') }
+    if ($Value -is [datetimeoffset]) { return $Value.ToString('o') }
+    try {
+        return ([datetimeoffset]([Management.ManagementDateTimeConverter]::ToDateTime([string]$Value))).ToString('o')
+    } catch {
+        return $null
+    }
+}
+
 $startedAt = Get-Date
 $instanceId = '{0}-{1}' -f $startedAt.ToString('yyyyMMdd-HHmmss'), ([guid]::NewGuid().ToString('N').Substring(0, 8))
 $title = "CODEX $instanceId"
 $launchPath = Join-Path $launchRoot "$instanceId.json"
 $parentPid = 0
+$launcherProc = $null
+$parentProc = $null
 try {
-    $parentPid = [int](Get-CimInstance Win32_Process -Filter "ProcessId=$PID").ParentProcessId
+    $launcherProc = Get-CimInstance Win32_Process -Filter "ProcessId=$PID"
+    $parentPid = [int]$launcherProc.ParentProcessId
+    if ($parentPid -gt 0) {
+        $parentProc = Get-CimInstance Win32_Process -Filter "ProcessId=$parentPid"
+    }
 } catch { }
 
 try { $Host.UI.RawUI.WindowTitle = $title } catch { }
@@ -26,6 +44,12 @@ try { $Host.UI.RawUI.WindowTitle = $title } catch { }
     LauncherProcessId = $PID
     ParentProcessId = $parentPid
     RootShellProcessId = $parentPid
+    LauncherProcessName = if ($launcherProc) { [string]$launcherProc.Name } else { 'powershell.exe' }
+    ParentProcessName = if ($parentProc) { [string]$parentProc.Name } else { '' }
+    RootShellProcessName = if ($parentProc) { [string]$parentProc.Name } else { '' }
+    LauncherProcessStartedAt = if ($launcherProc) { Convert-WmiDateToIsoString $launcherProc.CreationDate } else { ([datetimeoffset]$startedAt).ToString('o') }
+    ParentProcessStartedAt = if ($parentProc) { Convert-WmiDateToIsoString $parentProc.CreationDate } else { $null }
+    RootShellProcessStartedAt = if ($parentProc) { Convert-WmiDateToIsoString $parentProc.CreationDate } else { $null }
 } | ConvertTo-Json -Depth 3 | Set-Content -Path $launchPath -Encoding UTF8
 
 & codex
