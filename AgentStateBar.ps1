@@ -116,6 +116,7 @@ $script:ClaudeSessionByProcessId = @{}
 $script:ClaudeTelemetryFilesBySession = @{}
 $script:CodexThreadStates = @{}
 $script:CodexSessionOutcomeCache = @{}
+$script:CodexSessionBindings = @{}
 $script:ClaudeSessionStateCache = @{}
 $script:ClaudeTelemetryFileStateCache = @{}
 $script:CodexLogPosition = $null
@@ -135,6 +136,7 @@ $script:SessionStartMatchSeconds = 180
 $script:SessionActivityLeadSeconds = 15
 $script:SessionFutureStartGraceSeconds = 90
 $script:SessionStartPenaltySeconds = 600
+$script:CodexStrictSessionStartSeconds = 30
 $script:ClaudeSessionLoadIntervalSeconds = 4
 $script:ClaudeTelemetryLoadIntervalSeconds = 2
 
@@ -613,11 +615,24 @@ function Load-ClaudeSessions {
                 StateFilePath = $_.FullName
             }
             $items += $entry
-            $script:ClaudeSessionByProcessId[[int]$obj.pid] = $entry
         } catch { }
     }
 
-    $script:ClaudeSessions = @($items | Sort-Object StartTime -Descending)
+    $sessionOwners = @()
+    foreach ($group in ($items | Group-Object SessionId)) {
+        $owner = $group.Group |
+            Sort-Object `
+                @{ Expression = { $_.LastWriteTime }; Descending = $true }, `
+                @{ Expression = { $_.StartTime }; Descending = $true }, `
+                @{ Expression = { $_.ProcessId }; Descending = $true } |
+            Select-Object -First 1
+        if ($owner) {
+            $sessionOwners += $owner
+            $script:ClaudeSessionByProcessId[[int]$owner.ProcessId] = $owner
+        }
+    }
+
+    $script:ClaudeSessions = @($sessionOwners | Sort-Object StartTime -Descending)
 }
 
 function Find-ClaudeSession {
@@ -1139,15 +1154,31 @@ function Get-AgentProcesses {
         Where-Object { $_.AgentType -eq 'Claude' -and -not $_.HasSameAgentAncestor }
     )
 
-    foreach ($group in ($claudeCandidates | Group-Object GroupKey)) {
+    $mappedClaude = @(
+        $claudeCandidates |
+        Where-Object { $_.HasLiveClaudeSession } |
+        Sort-Object StartTime, ProcessId
+    )
+    $result += $mappedClaude
+
+    $occupiedClaudeGroups = @{}
+    foreach ($proc in $mappedClaude) {
+        $occupiedClaudeGroups[[string]$proc.GroupKey] = $true
+    }
+
+    $claudeFallbacks = @(
+        $claudeCandidates |
+        Where-Object { -not $_.HasLiveClaudeSession -and -not $occupiedClaudeGroups.ContainsKey([string]$_.GroupKey) }
+    )
+
+    foreach ($group in ($claudeFallbacks | Group-Object GroupKey)) {
         $selected = $group.Group |
             Sort-Object `
-                @{ Expression = { if ($_.HasLiveClaudeSession) { 0 } else { 1 } } }, `
                 @{ Expression = { if ($_.IsDirectShellChild) { 0 } else { 1 } } }, `
                 @{ Expression = { $_.DepthToShell } }, `
                 @{ Expression = { if ($shellNames -contains $_.ParentName) { 0 } else { 1 } } }, `
-                StartTime, `
-                ProcessId |
+                @{ Expression = { $_.StartTime }; Descending = $true }, `
+                @{ Expression = { $_.ProcessId }; Descending = $true } |
             Select-Object -First 1
         if ($selected) {
             $result += $selected
@@ -1336,19 +1367,139 @@ function Get-InstanceWindowProcessIds {
     return @($ordered)
 }
 
+function Get-AgentInstanceKeys {
+    param(
+        [string]$AgentType,
+        $Process = $null,
+        $Launch = $null
+    )
+
+    $keys = New-Object 'System.Collections.Generic.List[string]'
+    $seen = @{}
+    $candidates = @()
+    if ($Launch -and $Launch.InstanceId) {
+        $candidates += ('{0}:launch:{1}' -f $AgentType, [string]$Launch.InstanceId)
+    }
+    if ($Launch -and [int]$Launch.RootShellProcessId -gt 0) {
+        $candidates += ('{0}:shell:{1}' -f $AgentType, [int]$Launch.RootShellProcessId)
+    }
+    if ($Process -and [int]$Process.RootShellProcessId -gt 0) {
+        $candidates += ('{0}:shell:{1}' -f $AgentType, [int]$Process.RootShellProcessId)
+    }
+    if ($Launch -and [int]$Launch.ParentProcessId -gt 0) {
+        $candidates += ('{0}:parent:{1}' -f $AgentType, [int]$Launch.ParentProcessId)
+    }
+    if ($Process) {
+        $candidates += ('{0}:pid:{1}' -f $AgentType, [int]$Process.ProcessId)
+    }
+
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate) -or $seen.ContainsKey($candidate)) { continue }
+        $seen[$candidate] = $true
+        $keys.Add($candidate) | Out-Null
+    }
+
+    return @($keys)
+}
+
+function Get-CodexSessionAnchorTimes {
+    param(
+        $Process = $null,
+        $Launch = $null
+    )
+
+    $times = New-Object 'System.Collections.Generic.List[datetime]'
+    $seen = @{}
+    $candidates = @()
+    if ($Launch) { $candidates += $Launch.StartedAt }
+    if ($Process) { $candidates += $Process.StartTime }
+    if ($Process) { $candidates += $Process.ParentStartTime }
+
+    foreach ($candidate in $candidates) {
+        if ($null -eq $candidate -or $candidate -eq [datetime]::MinValue) { continue }
+        $key = ([datetime]$candidate).ToUniversalTime().Ticks
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $times.Add([datetime]$candidate) | Out-Null
+    }
+
+    return @($times)
+}
+
+function Get-CodexSessionBestStartDelta {
+    param(
+        $Session,
+        [datetime[]]$AnchorTimes
+    )
+
+    if (-not $Session -or -not $AnchorTimes -or $AnchorTimes.Count -eq 0) { return $null }
+
+    $startsTooLate = $true
+    $bestStartDelta = $null
+    foreach ($anchorTime in $AnchorTimes) {
+        if ($Session.StartTime -le $anchorTime.AddSeconds($script:SessionFutureStartGraceSeconds)) {
+            $startsTooLate = $false
+        }
+
+        $startDelta = [Math]::Abs(($Session.StartTime - $anchorTime).TotalSeconds)
+        if ($null -eq $bestStartDelta -or $startDelta -lt $bestStartDelta) {
+            $bestStartDelta = $startDelta
+        }
+    }
+
+    if ($startsTooLate) { return $null }
+    return [double]$bestStartDelta
+}
+
+function Find-CachedCodexSession {
+    param(
+        $Process,
+        $Launch = $null,
+        [hashtable]$PreviousBindings = $null,
+        [hashtable]$AssignedSessions = $null
+    )
+
+    if (-not $PreviousBindings -or $PreviousBindings.Count -eq 0) { return $null }
+
+    $anchorTimes = Get-CodexSessionAnchorTimes -Process $Process -Launch $Launch
+    if ($anchorTimes.Count -eq 0) { return $null }
+
+    $sessionById = @{}
+    foreach ($session in $script:CodexSessions) {
+        $sessionById[[string]$session.SessionId] = $session
+    }
+
+    foreach ($bindingKey in (Get-AgentInstanceKeys -AgentType 'Codex' -Process $Process -Launch $Launch)) {
+        if (-not $PreviousBindings.ContainsKey($bindingKey)) { continue }
+
+        $sessionId = [string]$PreviousBindings[$bindingKey]
+        if ($AssignedSessions -and $AssignedSessions.ContainsKey($sessionId)) { continue }
+        if (-not $sessionById.ContainsKey($sessionId)) { continue }
+
+        $session = $sessionById[$sessionId]
+        $startDelta = Get-CodexSessionBestStartDelta -Session $session -AnchorTimes $anchorTimes
+        if ($null -eq $startDelta) { continue }
+
+        return $session
+    }
+
+    return $null
+}
+
 function Find-BestCodexSession {
     param(
         [datetime]$ReferenceTime,
         [datetime]$AlternateTime = [datetime]::MinValue,
+        [datetime]$LaunchTime = [datetime]::MinValue,
         [hashtable]$AssignedSessions = $null
     )
-    if ($ReferenceTime -eq [datetime]::MinValue -and $AlternateTime -eq [datetime]::MinValue) {
+    if ($ReferenceTime -eq [datetime]::MinValue -and $AlternateTime -eq [datetime]::MinValue -and $LaunchTime -eq [datetime]::MinValue) {
         return $null
     }
 
     $bestSession = $null
     $bestScore = [double]::MaxValue
-    $anchorTimes = @($ReferenceTime, $AlternateTime | Where-Object { $_ -ne [datetime]::MinValue })
+    $anchorTimes = @($LaunchTime, $ReferenceTime, $AlternateTime | Where-Object { $_ -ne [datetime]::MinValue })
     $now = Get-Date
     foreach ($candidate in $script:CodexSessions) {
         if ($AssignedSessions -and $AssignedSessions.ContainsKey($candidate.SessionId)) { continue }
@@ -1359,8 +1510,8 @@ function Find-BestCodexSession {
         }
 
         $hasStrongSignal = $false
-        $startsTooLate = $true
-        $bestStartDelta = [double]::MaxValue
+        $bestStartDelta = Get-CodexSessionBestStartDelta -Session $candidate -AnchorTimes $anchorTimes
+        if ($null -eq $bestStartDelta) { continue }
         $latestActivityTime = $null
 
         if ($candidate.LastWriteTime) {
@@ -1376,16 +1527,7 @@ function Find-BestCodexSession {
         }
 
         foreach ($anchorTime in $anchorTimes) {
-            if ($candidate.StartTime -le $anchorTime.AddSeconds($script:SessionFutureStartGraceSeconds)) {
-                $startsTooLate = $false
-            }
-
-            $startDelta = [Math]::Abs(($candidate.StartTime - $anchorTime).TotalSeconds)
-            if ($startDelta -lt $bestStartDelta) {
-                $bestStartDelta = $startDelta
-            }
-
-            if ($startDelta -le $script:SessionStartMatchSeconds) {
+            if ($bestStartDelta -le $script:SessionStartMatchSeconds) {
                 $hasStrongSignal = $true
             }
 
@@ -1394,19 +1536,21 @@ function Find-BestCodexSession {
             }
         }
 
-        if ($startsTooLate) { continue }
         if (-not $hasStrongSignal) { continue }
 
         $recencyPenalty = 86400.0
         if ($latestActivityTime) {
             $recencyPenalty = [Math]::Max(0, ($now - $latestActivityTime).TotalSeconds)
         }
-        $startPenalty = if ($bestStartDelta -le $script:SessionStartMatchSeconds) {
-            $bestStartDelta / 1000.0
+
+        $startPenalty = if ($bestStartDelta -le $script:CodexStrictSessionStartSeconds) {
+            ($bestStartDelta * 50.0) + ($recencyPenalty / 10.0)
+        } elseif ($bestStartDelta -le $script:SessionStartMatchSeconds) {
+            ($bestStartDelta * 12.0) + $recencyPenalty
         } else {
-            $script:SessionStartPenaltySeconds + ($bestStartDelta / 1000.0)
+            ($script:SessionStartPenaltySeconds * 12.0) + ($bestStartDelta * 12.0) + $recencyPenalty
         }
-        $score = $recencyPenalty + $startPenalty
+        $score = $startPenalty
 
         if ($score -lt $bestScore) {
             $bestSession = $candidate
@@ -1600,22 +1744,30 @@ function Match-Instances {
     Load-ClaudeSessions
     $launches = Load-LaunchRecords
     $processMap = Get-ProcessSnapshot
+    $previousCodexBindings = @{}
+    foreach ($key in $script:CodexSessionBindings.Keys) {
+        $previousCodexBindings[$key] = $script:CodexSessionBindings[$key]
+    }
     $assignedSessions = @{}
     $assignedLaunches = @{}
     $matched = @()
 
     foreach ($proc in $Processes) {
+        $launch = Find-BestLaunchRecord -AgentType $proc.AgentType -ReferenceTime $proc.StartTime -Launches $launches -AssignedLaunches $assignedLaunches -Process $proc -ProcessMap $processMap
+        if ($launch) { $assignedLaunches[$launch.InstanceId] = $true }
+
         $session = $null
         if ($proc.AgentType -eq 'Codex') {
-            $session = Find-BestCodexSession -ReferenceTime $proc.StartTime -AlternateTime $proc.ParentStartTime -AssignedSessions $assignedSessions
+            $session = Find-CachedCodexSession -Process $proc -Launch $launch -PreviousBindings $previousCodexBindings -AssignedSessions $assignedSessions
+            if (-not $session) {
+                $launchTime = if ($launch) { $launch.StartedAt } else { [datetime]::MinValue }
+                $session = Find-BestCodexSession -ReferenceTime $proc.StartTime -AlternateTime $proc.ParentStartTime -LaunchTime $launchTime -AssignedSessions $assignedSessions
+            }
         } elseif ($proc.AgentType -eq 'Claude') {
             $session = Find-ClaudeSession -Process $proc
         }
 
-        $launch = Find-BestLaunchRecord -AgentType $proc.AgentType -ReferenceTime $proc.StartTime -Launches $launches -AssignedLaunches $assignedLaunches -Process $proc -ProcessMap $processMap
-
         if ($session) { $assignedSessions[$session.SessionId] = $true }
-        if ($launch) { $assignedLaunches[$launch.InstanceId] = $true }
         $matched += [pscustomobject]@{
             AgentType = $proc.AgentType
             Process = $proc
@@ -1640,6 +1792,14 @@ function Match-Instances {
             LaunchOnly = $true
         }
     }
+
+    $newCodexBindings = @{}
+    foreach ($instance in ($matched | Where-Object { $_.AgentType -eq 'Codex' -and $_.Session -and -not $_.LaunchOnly })) {
+        foreach ($bindingKey in (Get-AgentInstanceKeys -AgentType 'Codex' -Process $instance.Process -Launch $instance.Launch)) {
+            $newCodexBindings[$bindingKey] = [string]$instance.Session.SessionId
+        }
+    }
+    $script:CodexSessionBindings = $newCodexBindings
 
     return $matched
 }
@@ -1964,8 +2124,9 @@ function Find-AgentWindow {
             $candidate = $windows |
                 Where-Object { $_.ProcessId -eq $candidatePid } |
                 Sort-Object `
+                    @{ Expression = { if ($_.ClassName -eq 'PseudoConsoleWindow') { 0 } else { 1 } } }, `
                     @{ Expression = { if ([string]::IsNullOrWhiteSpace($_.Title)) { 1 } else { 0 } } }, `
-                    @{ Expression = { if ($_.Iconic) { 0 } else { 1 } } } |
+                    @{ Expression = { if ($_.Iconic) { 1 } else { 0 } } } |
                 Select-Object -First 1
             if ($candidate) {
                 $target = $candidate
@@ -1976,19 +2137,16 @@ function Find-AgentWindow {
 
     if (-not $target -and $Instance.Session -and $Instance.Session.Cwd) {
         $leaf = [regex]::Escape((Split-Path -Leaf $Instance.Session.Cwd))
-        $target = $terminalWindows | Where-Object { $_.Title -match $leaf } | Select-Object -First 1
+        if (-not [string]::IsNullOrWhiteSpace($leaf)) {
+            $cwdMatches = @($terminalWindows | Where-Object { $_.Title -match $leaf })
+            if ($cwdMatches.Count -eq 1) {
+                $target = $cwdMatches[0]
+            }
+        }
     }
 
-    if (-not $target -and $Instance.AgentType -eq 'Claude') {
-        $target = $terminalWindows | Where-Object { $_.Title -match 'CLAUDE|Claude|claudeproject' } | Select-Object -First 1
-    }
-
-    if (-not $target -and $Instance.AgentType -eq 'Codex') {
-        $target = $terminalWindows | Where-Object { $_.Title -match 'CODEX|Codex' } | Select-Object -First 1
-    }
-
-    if (-not $target) {
-        $target = $terminalWindows | Select-Object -First 1
+    if ($target -and $target.ClassName -eq 'PseudoConsoleWindow') {
+        return $target
     }
 
     return Resolve-AgentWindowTarget -Window $target -Windows $windows
@@ -1998,6 +2156,22 @@ function Restore-AgentWindow {
     param($Instance)
     $target = Find-AgentWindow $Instance
     if (-not $target) { return $false }
+    $rootHandle = [IntPtr]::Zero
+    if ($target.RootOwnerHandleValue -ne 0 -and $target.RootOwnerHandleValue -ne $target.HandleValue) {
+        $rootHandle = $target.RootOwnerHandle
+    } elseif ($target.RootHandleValue -ne 0 -and $target.RootHandleValue -ne $target.HandleValue) {
+        $rootHandle = $target.RootHandle
+    }
+
+    if ($rootHandle -ne [IntPtr]::Zero) {
+        [void][AgentStateNative]::ShowWindowAsync($rootHandle, [AgentStateNative]::SW_RESTORE)
+        Start-Sleep -Milliseconds 70
+        [void][AgentStateNative]::ShowWindow($rootHandle, [AgentStateNative]::SW_SHOW)
+        [void][AgentStateNative]::BringWindowToTop($rootHandle)
+        [void][AgentStateNative]::SetForegroundWindow($rootHandle)
+        Start-Sleep -Milliseconds 50
+    }
+
     [void][AgentStateNative]::ShowWindowAsync($target.Handle, [AgentStateNative]::SW_RESTORE)
     Start-Sleep -Milliseconds 80
     [void][AgentStateNative]::ShowWindow($target.Handle, [AgentStateNative]::SW_SHOW)
